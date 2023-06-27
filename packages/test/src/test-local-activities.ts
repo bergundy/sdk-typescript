@@ -594,6 +594,27 @@ test.serial('issue-731', async (t) => {
   });
 });
 
+export async function runBlockingLocalActivity(): Promise<void> {
+  await workflow.proxyLocalActivities({ startToCloseTimeout: '3s' }).block();
+}
+
+test.serial('Local activity is retried after start to close timeout expires', async (t) => {
+  const { startWorkflow, createWorker } = helpers(t);
+  const worker = await createWorker({
+    activities: {
+      async block(): Promise<void> {
+        await ActivityContext.current().cancelled;
+      },
+    },
+  });
+  await worker.runUntil(async () => {
+    const handle = await startWorkflow(runBlockingLocalActivity, {
+      workflowTaskTimeout: '1m', // Give our local activities enough time to run in CI
+    });
+    await handle.result();
+  });
+});
+
 export const interceptors: workflow.WorkflowInterceptorsFactory = () => {
   return {
     outbound: [
