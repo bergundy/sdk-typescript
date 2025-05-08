@@ -1,3 +1,4 @@
+import * as nexus from 'nexus-rpc';
 import { filterNullAndUndefined } from '@temporalio/common/lib/internal-non-workflow';
 import { AsyncCompletionClient } from './async-completion-client';
 import { BaseClient, BaseClientOptions, defaultBaseClientOptions, LoadedWithDefaults } from './base-client';
@@ -6,6 +7,7 @@ import { ScheduleClient } from './schedule-client';
 import { QueryRejectCondition, WorkflowService } from './types';
 import { WorkflowClient } from './workflow-client';
 import { TaskQueueClient } from './task-queue-client';
+import { NexusClient, NexusClientOptions } from './nexus';
 
 export interface ClientOptions extends BaseClientOptions {
   /**
@@ -106,5 +108,12 @@ export class Client extends BaseClient {
    */
   get workflowService(): WorkflowService {
     return this.connection.workflowService;
+  }
+
+  public nexusService(service: string, _options: NexusClientOptions): NexusClient<nexus.Service>;
+  public nexusService<T extends nexus.Service>(_service: T, _options: NexusClientOptions): NexusClient<T>;
+
+  public nexusService(_service: any, _options: NexusClientOptions): NexusClient<nexus.Service> {
+    return {} as any;
   }
 }

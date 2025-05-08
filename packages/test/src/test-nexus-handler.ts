@@ -153,16 +153,39 @@ test('async operation handler happy path', async (t) => {
   const { env, taskQueue, httpPort, endpointId } = t.context;
   const requestId = 'test-' + randomUUID();
 
+  const service = nexus.service('testService', {
+    // Also test custom operation name.
+    testAsyncOp: nexus.operation<string, string>({ name: 'async-op' }),
+  });
+
+  const s = env.client.nexusService(service, { endpoint: 'some-endpoint' });
+
+  {
+    const promise = s.startOperation(service.operations.testAsyncOp, 'hello');
+    const handle = await promise;
+    // For advanced use cases allow getting more information from the responses.
+    // const links = await promise.links();
+    const result = await handle.getResult();
+    t.is(result, 'hello');
+    const { state } = await handle.getInfo();
+    await handle.cancel();
+  }
+
+  {
+    const promise = s.executeOperation(service.operations.testAsyncOp, 'hello');
+    const result = await promise;
+    // links are also available on execute, e.g. for sync response or async with a getResult call.
+    // const links = await promise.links();
+    t.is(result, 'hello');
+  }
+
   const w = await Worker.create({
     connection: env.nativeConnection,
     namespace: env.namespace,
     taskQueue,
     nexusServices: [
       nexus.serviceHandler(
-        nexus.service('testService', {
-          // Also test custom operation name.
-          testAsyncOp: nexus.operation<string, string>({ name: 'async-op' }),
-        }),
+        service,
         {
           testAsyncOp: {
             async start(input, options): Promise<nexus.HandlerStartOperationResult<string>> {
