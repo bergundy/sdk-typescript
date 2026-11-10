@@ -20,10 +20,18 @@ export async function speculativeBlockCommands(): Promise<void> {
 }
 
 export async function speculativeNestedBlocks(): Promise<void> {
+  let leftRunning: Promise<void> | undefined;
   await speculative(async () => {
-    await speculative(() => sleep(1));
-    await sleep(2);
+    await speculative(async () => {
+      // Outlives the inner block (sleep(4)), then the outer one too (sleep(5))
+      leftRunning = sleep(1)
+        .then(() => sleep(4))
+        .then(() => sleep(5));
+      await sleep(2);
+    });
+    await sleep(3);
   });
+  await leftRunning;
 }
 
 const { echo } = proxyLocalActivities<typeof activities>({ startToCloseTimeout: '1m' });

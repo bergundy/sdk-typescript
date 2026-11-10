@@ -9,29 +9,48 @@ import { assertInWorkflowContext } from './global-attributes';
  *
  * Like {@link CancellationScope}, the scope follows async context: Activities and timers started
  * by code running inside the block, including Promises started inside it and left running, are
- * covered while the block is {@link SpeculativeScope.active | active}. Once the block's function
- * settles, the scope is no longer active, so commands issued afterwards by work it left running are
- * sent normally.
+ * covered while the scope is {@link SpeculativeScope.active | active}. Speculative blocks nest: work
+ * that a nested block leaves running is also inside the enclosing blocks, so it stays covered while
+ * any of them is still running. Once the block and every enclosing block have exited, commands
+ * issued by work they left running are sent normally.
  *
  * @experimental Speculative blocks are an experimental feature and may change without notice.
  */
 export class SpeculativeScope {
+  /**
+   * The innermost speculative scope of the code that created this scope, if any.
+   */
+  public readonly parent?: SpeculativeScope;
+
   #state: 'new' | 'active' | 'exited' = 'new';
 
+  constructor() {
+    this.parent = SpeculativeScope.current();
+  }
+
   /**
-   * Whether the block is running, i.e. its function was called and hasn't settled yet.
+   * Whether work started inside the block is still covered by it: the block is running (its function
+   * was called and hasn't settled yet), or it exited but an enclosing block is still active.
    *
    * Activities and timers started while the current scope is active are marked as speculative.
    */
   public get active(): boolean {
-    return this.#state === 'active';
+    switch (this.#state) {
+      case 'new':
+        return false;
+      case 'active':
+        return true;
+      case 'exited':
+        return this.parent?.active ?? false;
+    }
   }
 
   /**
    * Activate the scope as current and run `fn` in it. A scope can only run once.
    *
-   * The scope stops being active as soon as the Promise returned by `fn` settles. Exiting doesn't
-   * wait for anything else, and code after the block doesn't wait for a round trip to the Service.
+   * The block exits as soon as the Promise returned by `fn` settles. From then on the scope is only
+   * active while an enclosing block is. Exiting doesn't wait for anything else, and code after the
+   * block doesn't wait for a round trip to the Service.
    *
    * @return the result of `fn`
    */
@@ -111,7 +130,8 @@ const storage: ALS<SpeculativeScope> = new AsyncLocalStorage();
  *   slots, Service support, the time left in the Workflow Task, and so on. Workflow code behaves the
  *   same either way, and replay works with both kinds of history.
  * - The block follows async context, like a {@link CancellationScope}: Promises started inside it are
- *   covered while it's running, and stop being covered once `fn` settles.
+ *   covered while it's running, and stop being covered once `fn` settles, unless an enclosing
+ *   speculative block is still running.
  * - Progress inside a speculation window isn't durable until the next checkpoint. If the Worker
  *   crashes, the Workflow resumes from the last checkpoint and runs those Activities again, without
  *   increasing their attempt number, as with Local Activities.

@@ -1867,30 +1867,35 @@ test('speculativeBlockCommands', async (t) => {
 
 test('speculativeNestedBlocks', async (t) => {
   const { workflowType } = t.context;
+  const speculativeTimer = (seq: number) =>
+    makeStartTimerCommand({ seq, startToFireTimeout: msToTs(seq), speculative: true });
   {
     const req = await activate(t, makeStartWorkflow(workflowType));
-    compareCompletion(
-      t,
-      req,
-      makeSpeculativeSuccess([makeStartTimerCommand({ seq: 1, startToFireTimeout: msToTs(1), speculative: true })], {
-        active: true,
-      })
-    );
+    compareCompletion(t, req, makeSpeculativeSuccess([speculativeTimer(1), speculativeTimer(2)], { active: true }));
   }
   {
-    const req = await activate(t, makeFireTimer(1));
-    compareCompletion(
-      t,
-      req,
-      makeSpeculativeSuccess([makeStartTimerCommand({ seq: 2, startToFireTimeout: msToTs(2), speculative: true })], {
-        exited: true,
-        active: true,
-      })
-    );
-  }
-  {
+    // The inner block exits
     const req = await activate(t, makeFireTimer(2));
-    compareCompletion(t, req, makeSpeculativeSuccess([makeCompleteWorkflowExecution()], { exited: true }));
+    compareCompletion(t, req, makeSpeculativeSuccess([speculativeTimer(3)], { exited: true, active: true }));
+  }
+  {
+    // Work the inner block left running is still covered by the outer block
+    const req = await activate(t, makeFireTimer(1));
+    compareCompletion(t, req, makeSpeculativeSuccess([speculativeTimer(4)], { active: true }));
+  }
+  {
+    // The outer block exits
+    const req = await activate(t, makeFireTimer(3));
+    compareCompletion(t, req, makeSpeculativeSuccess([], { exited: true }));
+  }
+  {
+    // Work that outlived every block is no longer covered
+    const req = await activate(t, makeFireTimer(4));
+    compareCompletion(t, req, makeSuccess([makeStartTimerCommand({ seq: 5, startToFireTimeout: msToTs(5) })]));
+  }
+  {
+    const req = await activate(t, makeFireTimer(5));
+    compareCompletion(t, req, makeSuccess());
   }
 });
 
