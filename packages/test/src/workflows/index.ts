@@ -80,6 +80,7 @@ export * from './signals-timers-activities-order';
 export * from './sinks';
 export * from './sleep';
 export * from './smorgasbord';
+export * from './speculative';
 export * from './stack-tracer';
 export * from './success-string';
 export * from './swc';

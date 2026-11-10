@@ -1803,6 +1803,106 @@ test('cancelActivityAfterFirstCompletion', async (t) => {
   t.deepEqual(logs, [['Workflow cancelled while waiting on non cancellable scope']]);
 });
 
+function makeSpeculativeSuccess(
+  commands: coresdk.workflow_commands.IWorkflowCommand[],
+  { exited, active }: { exited?: boolean; active?: boolean }
+): coresdk.workflow_completion.IWorkflowActivationCompletion {
+  const { successful } = makeSuccess(commands);
+  return { successful: { ...successful, speculativeBlockExited: exited, speculativeBlockActive: active } };
+}
+
+test('speculativeBlockCommands', async (t) => {
+  const { workflowType } = t.context;
+  const url = 'https://temporal.io';
+  {
+    const req = await activate(t, makeStartWorkflow(workflowType));
+    compareCompletion(t, req, makeSuccess([makeStartTimerCommand({ seq: 1, startToFireTimeout: msToTs(1) })]));
+  }
+  {
+    const req = await activate(t, makeFireTimer(1));
+    compareCompletion(
+      t,
+      req,
+      makeSpeculativeSuccess(
+        [
+          makeStartTimerCommand({ seq: 2, startToFireTimeout: msToTs(2), speculative: true }),
+          makeStartTimerCommand({ seq: 3, startToFireTimeout: msToTs(3), speculative: true }),
+          makeScheduleActivityCommand({
+            seq: 1,
+            activityId: '1',
+            activityType: 'httpGet',
+            arguments: toPayloads(defaultPayloadConverter, url),
+            startToCloseTimeout: msToTs('10m'),
+            taskQueue: 'test',
+            doNotEagerlyExecute: false,
+            versioningIntent: coresdk.common.VersioningIntent.UNSPECIFIED,
+            speculative: true,
+          }),
+        ],
+        { active: true }
+      )
+    );
+  }
+  {
+    const req = await activate(t, makeFireTimer(3));
+    compareCompletion(t, req, makeSpeculativeSuccess([], { active: true }));
+  }
+  {
+    const req = await activate(
+      t,
+      makeResolveActivity(1, { completed: { result: defaultPayloadConverter.toPayload('response') } })
+    );
+    compareCompletion(t, req, makeSpeculativeSuccess([], { exited: true }));
+  }
+  {
+    // Started inside the block, but issued after it exited
+    const req = await activate(t, makeFireTimer(2));
+    compareCompletion(t, req, makeSuccess([makeStartTimerCommand({ seq: 4, startToFireTimeout: msToTs(4) })]));
+  }
+  {
+    const req = await activate(t, makeFireTimer(4));
+    compareCompletion(t, req, makeSuccess());
+  }
+});
+
+test('speculativeNestedBlocks', async (t) => {
+  const { workflowType } = t.context;
+  {
+    const req = await activate(t, makeStartWorkflow(workflowType));
+    compareCompletion(
+      t,
+      req,
+      makeSpeculativeSuccess([makeStartTimerCommand({ seq: 1, startToFireTimeout: msToTs(1), speculative: true })], {
+        active: true,
+      })
+    );
+  }
+  {
+    const req = await activate(t, makeFireTimer(1));
+    compareCompletion(
+      t,
+      req,
+      makeSpeculativeSuccess([makeStartTimerCommand({ seq: 2, startToFireTimeout: msToTs(2), speculative: true })], {
+        exited: true,
+        active: true,
+      })
+    );
+  }
+  {
+    const req = await activate(t, makeFireTimer(2));
+    compareCompletion(t, req, makeSpeculativeSuccess([makeCompleteWorkflowExecution()], { exited: true }));
+  }
+});
+
+test('speculativeLocalActivity', async (t) => {
+  const { workflowType } = t.context;
+  const req = await activate(t, makeStartWorkflow(workflowType));
+  t.regex(
+    req.failed?.failure?.message ?? '',
+    /Local activity of type 'echo' can't be scheduled inside a speculative block/
+  );
+});
+
 test('multipleActivitiesSingleTimeout', async (t) => {
   const urls = ['https://slow-site.com/', 'https://slow-site.org/'];
   const { workflowType } = t.context;
