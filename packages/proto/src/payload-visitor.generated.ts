@@ -3553,6 +3553,10 @@ function walk_temporal_api_command_v1_Command<Ctx>(
     if (c != null) walk_temporal_api_command_v1_ScheduleActivityTaskCommandAttributes(c, env, ctx, pending);
   }
   {
+    const c = o.startTimerCommandAttributes;
+    if (c != null) walk_temporal_api_command_v1_StartTimerCommandAttributes(c, env, ctx, pending);
+  }
+  {
     const c = o.completeWorkflowExecutionCommandAttributes;
     if (c != null) walk_temporal_api_command_v1_CompleteWorkflowExecutionCommandAttributes(c, env, ctx, pending);
   }
@@ -3591,6 +3595,10 @@ function walk_temporal_api_command_v1_Command<Ctx>(
   {
     const c = o.scheduleNexusOperationCommandAttributes;
     if (c != null) walk_temporal_api_command_v1_ScheduleNexusOperationCommandAttributes(c, env, ctx, pending);
+  }
+  {
+    const c = o.resolveOptimisticActivityCommandAttributes;
+    if (c != null) walk_temporal_api_command_v1_ResolveOptimisticActivityCommandAttributes(c, env, ctx, pending);
   }
 }
 
@@ -3678,6 +3686,19 @@ function walk_temporal_api_command_v1_ModifyWorkflowPropertiesCommandAttributes<
   }
 }
 
+function walk_temporal_api_command_v1_OptimisticStart<Ctx>(
+  o: temporal.api.command.v1.IOptimisticStart,
+  env: WalkEnv<Ctx>,
+  context: Ctx,
+  pending: Promise<unknown>[]
+): void {
+  const ctx = env.deriveContext ? env.deriveContext(o, 'temporal.api.command.v1.OptimisticStart', context) : context;
+  {
+    const c = o.heartbeatDetails;
+    if (c != null) walk_temporal_api_common_v1_Payloads(c, env, ctx, pending);
+  }
+}
+
 function walk_temporal_api_command_v1_RecordMarkerCommandAttributes<Ctx>(
   o: temporal.api.command.v1.IRecordMarkerCommandAttributes,
   env: WalkEnv<Ctx>,
@@ -3703,6 +3724,57 @@ function walk_temporal_api_command_v1_RecordMarkerCommandAttributes<Ctx>(
   }
 }
 
+function walk_temporal_api_command_v1_ResolveOptimisticActivityCommandAttributes<Ctx>(
+  o: temporal.api.command.v1.IResolveOptimisticActivityCommandAttributes,
+  env: WalkEnv<Ctx>,
+  context: Ctx,
+  pending: Promise<unknown>[]
+): void {
+  const ctx = env.deriveContext
+    ? env.deriveContext(o, 'temporal.api.command.v1.ResolveOptimisticActivityCommandAttributes', context)
+    : context;
+  {
+    const c = o.completed;
+    if (c != null)
+      walk_temporal_api_command_v1_ResolveOptimisticActivityCommandAttributes_Completed(c, env, ctx, pending);
+  }
+  {
+    const c = o.canceled;
+    if (c != null)
+      walk_temporal_api_command_v1_ResolveOptimisticActivityCommandAttributes_Canceled(c, env, ctx, pending);
+  }
+}
+
+function walk_temporal_api_command_v1_ResolveOptimisticActivityCommandAttributes_Canceled<Ctx>(
+  o: temporal.api.command.v1.ResolveOptimisticActivityCommandAttributes.ICanceled,
+  env: WalkEnv<Ctx>,
+  context: Ctx,
+  pending: Promise<unknown>[]
+): void {
+  const ctx = env.deriveContext
+    ? env.deriveContext(o, 'temporal.api.command.v1.ResolveOptimisticActivityCommandAttributes.Canceled', context)
+    : context;
+  {
+    const c = o.details;
+    if (c != null) walk_temporal_api_common_v1_Payloads(c, env, ctx, pending);
+  }
+}
+
+function walk_temporal_api_command_v1_ResolveOptimisticActivityCommandAttributes_Completed<Ctx>(
+  o: temporal.api.command.v1.ResolveOptimisticActivityCommandAttributes.ICompleted,
+  env: WalkEnv<Ctx>,
+  context: Ctx,
+  pending: Promise<unknown>[]
+): void {
+  const ctx = env.deriveContext
+    ? env.deriveContext(o, 'temporal.api.command.v1.ResolveOptimisticActivityCommandAttributes.Completed', context)
+    : context;
+  {
+    const c = o.result;
+    if (c != null) walk_temporal_api_common_v1_Payloads(c, env, ctx, pending);
+  }
+}
+
 function walk_temporal_api_command_v1_ScheduleActivityTaskCommandAttributes<Ctx>(
   o: temporal.api.command.v1.IScheduleActivityTaskCommandAttributes,
   env: WalkEnv<Ctx>,
@@ -3721,6 +3793,10 @@ function walk_temporal_api_command_v1_ScheduleActivityTaskCommandAttributes<Ctx>
   {
     const c = o.input;
     if (c != null) walk_temporal_api_common_v1_Payloads(c, env, ctx, pending);
+  }
+  {
+    const c = o.optimisticStart;
+    if (c != null) walk_temporal_api_command_v1_OptimisticStart(c, env, ctx, pending);
   }
 }
 
@@ -3793,6 +3869,21 @@ function walk_temporal_api_command_v1_StartChildWorkflowExecutionCommandAttribut
       const c = o.searchAttributes;
       if (c != null) walk_temporal_api_common_v1_SearchAttributes(c, env, ctx, pending);
     }
+  }
+}
+
+function walk_temporal_api_command_v1_StartTimerCommandAttributes<Ctx>(
+  o: temporal.api.command.v1.IStartTimerCommandAttributes,
+  env: WalkEnv<Ctx>,
+  context: Ctx,
+  pending: Promise<unknown>[]
+): void {
+  const ctx = env.deriveContext
+    ? env.deriveContext(o, 'temporal.api.command.v1.StartTimerCommandAttributes', context)
+    : context;
+  {
+    const c = o.optimisticStart;
+    if (c != null) walk_temporal_api_command_v1_OptimisticStart(c, env, ctx, pending);
   }
 }
 
@@ -6575,6 +6666,10 @@ function walk_temporal_api_workflowservice_v1_RespondWorkflowTaskCompletedRespon
   }
   {
     const a = o.activityTasks;
+    if (a) for (const v of a) walk_temporal_api_workflowservice_v1_PollActivityTaskQueueResponse(v, env, ctx, pending);
+  }
+  {
+    const a = o.optimisticActivityTasks;
     if (a) for (const v of a) walk_temporal_api_workflowservice_v1_PollActivityTaskQueueResponse(v, env, ctx, pending);
   }
 }
