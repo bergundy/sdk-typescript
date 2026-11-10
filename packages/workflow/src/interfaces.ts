@@ -824,4 +824,8 @@ export interface ActivationCompletion {
   commands: coresdk.workflow_commands.IWorkflowCommand[];
   usedInternalFlags: number[];
   versioningBehavior?: VersioningBehavior;
+  /** A speculative block exited during this activation. */
+  speculativeBlockExited?: boolean;
+  /** At least one speculative block is running at the end of this activation. */
+  speculativeBlockActive?: boolean;
 }

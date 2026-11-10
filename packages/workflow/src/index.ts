@@ -76,6 +76,9 @@ export async function sampleWorkflow(): Promise<string> {
  * - [Cancellation and scopes](https://docs.temporal.io/typescript/cancellation-scopes)
  *   - {@link CancellationScope}
  *   - {@link Trigger}
+ * - Speculative blocks (experimental)
+ *   - {@link speculative}
+ *   - {@link SpeculativeScope}
  * - [Sinks](https://docs.temporal.io/application-development/observability/?lang=ts#logging)
  *   - {@link Sinks}
  *
@@ -125,6 +128,7 @@ export {
 export type { BaseWorkflowHandle, WorkflowQueryOptions, WorkflowSignalOptions } from '@temporalio/common';
 export * from '@temporalio/common/internal/workflow-options';
 export { AsyncLocalStorage, CancellationScope, CancellationScopeOptions } from './cancellation-scope';
+export { SpeculativeScope, speculative } from './speculative-scope';
 export * from './errors';
 export * from './interceptors';
 export {

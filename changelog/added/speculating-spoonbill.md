@@ -1,0 +1,1 @@
+Experimental `speculative()` blocks in `@temporalio/workflow` let Activities and timers start right away on the Worker, before the Temporal Service knows about them, when the namespace supports optimistic start. History still records ordinary Activity and timer events.

@@ -9,6 +9,7 @@ import { currentRandom } from './current-random';
 import { DeterminismViolationError } from './errors';
 import { getActivator } from './global-attributes';
 import { SdkFlags } from './flags';
+import { inSpeculativeBlock } from './speculative-scope';
 import { sleep } from './workflow';
 import { untrackPromise } from './stack-helpers';
 
@@ -100,6 +101,7 @@ export function overrideGlobals(): void {
           startTimer: {
             seq,
             startToFireTimeout: msToTs(ms),
+            speculative: inSpeculativeBlock() || undefined,
           },
         });
       }).then(

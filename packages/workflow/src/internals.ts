@@ -444,6 +444,16 @@ export class Activator implements ActivationHandler {
   protected cancelled = false;
 
   /**
+   * Number of speculative blocks (see {@link speculative}) that are currently running.
+   */
+  public activeSpeculativeBlocks = 0;
+
+  /**
+   * Whether a speculative block exited during the current activation. Reset after each activation.
+   */
+  public speculativeBlockExited = false;
+
+  /**
    * The next (incremental) sequence to assign when generating completable commands
    */
   public nextSeqs = {
@@ -662,10 +672,15 @@ export class Activator implements ActivationHandler {
   }
 
   concludeActivation(): ActivationCompletion {
+    const speculativeBlockExited = this.speculativeBlockExited;
+    this.speculativeBlockExited = false;
     return {
       commands: this.commands.splice(0),
       usedInternalFlags: [...this.knownFlags],
       versioningBehavior: this.versioningBehavior,
+      // Only set when true, to keep completions without speculative blocks unchanged
+      speculativeBlockExited: speculativeBlockExited || undefined,
+      speculativeBlockActive: this.activeSpeculativeBlocks > 0 || undefined,
     };
   }
 

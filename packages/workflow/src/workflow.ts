@@ -30,6 +30,7 @@ import {
   encodeWorkflowIdReusePolicy,
   extractWorkflowTypeAndConfig,
   HandlerUnfinishedPolicy,
+  IllegalStateError,
   mapToPayloads,
   encodeInitialVersioningBehavior,
   toPayloadsWithContext,
@@ -51,6 +52,7 @@ import { eventGroupMarkersToProto, type EventGroup, type EventGroupsOptions } fr
 import { CancellationScope, registerSleepImplementation } from './cancellation-scope';
 import { composeInterceptors } from './interceptor-composition';
 import { UpdateScope } from './update-scope';
+import { inSpeculativeBlock } from './speculative-scope';
 import { type ActivityOptions, encodeActivityCancellationType, type LocalActivityOptions } from './activities';
 import type {
   ActivityInput,
@@ -167,6 +169,7 @@ function timerNextHandler({ seq, durationMs, options }: TimerInput) {
       startTimer: {
         seq,
         startToFireTimeout: msToTs(durationMs),
+        speculative: inSpeculativeBlock() || undefined,
       },
       userMetadata: userMetadataToPayload(activator.payloadConverter, options?.summary, undefined, context),
       eventGroupMarkers: eventGroupMarkersToProto(options?.eventGroups),
@@ -264,6 +267,7 @@ function scheduleActivityNextHandler({
         doNotEagerlyExecute: !(options.allowEagerDispatch ?? true),
         versioningIntent: versioningIntentToProto(options.versioningIntent),
         priority: options.priority ? compilePriority(options.priority) : undefined,
+        speculative: inSpeculativeBlock() || undefined,
       },
       userMetadata: userMetadataToPayload(activator.payloadConverter, options.summary, undefined, context),
       eventGroupMarkers: eventGroupMarkersToProto(options.eventGroups),
@@ -291,6 +295,16 @@ async function scheduleLocalActivityNextHandler({
   typeInfo,
 }: LocalActivityInput): Promise<unknown> {
   const activator = getActivator();
+  if (inSpeculativeBlock()) {
+    // Local Activities and speculation windows can't share a Workflow Task. Fail the Workflow Task
+    // even if Workflow code catches the error, like other API misuse.
+    const err = new IllegalStateError(
+      `Local activity of type '${activityType}' can't be scheduled inside a speculative block; ` +
+        'use a regular Activity (proxyActivities) or schedule it outside of the block'
+    );
+    activator.recordWorkflowTaskError(err);
+    throw err;
+  }
   const activityId = `${seq}`;
   const context = activitySerializationContext(activator.info, activityId, true);
 
