@@ -1,9 +1,10 @@
 /**
  * Tests for speculative blocks (optimistic start of Activities and timers).
  *
- * IMPORTANT: Except for the test that starts its own dev server, tests in this file require a server
- * whose `default` namespace has the `optimistic_start` capability (dynamic config
- * `system.enableOptimisticStart`). Run with e.g. `TEMPORAL_SERVICE_ADDRESS=localhost:27233`.
+ * Every test runs against servers with and without the `optimistic_start` namespace capability.
+ * Without it the SDK never starts anything optimistically, so workflows must behave the same while
+ * history stays free of optimistic flags. To cover the capability, run against a server with the
+ * `system.enableOptimisticStart` dynamic config, e.g. `TEMPORAL_SERVICE_ADDRESS=localhost:27233`.
  */
 import { setTimeout as setTimeoutPromise } from 'timers/promises';
 import type { ExecutionContext } from 'ava';
@@ -15,7 +16,7 @@ import type { temporal } from '@temporalio/proto';
 import * as wf from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/workflow';
 import type { Context } from './helpers-integration';
-import { createLocalTestEnvironment, helpers, makeTestFunction } from './helpers-integration';
+import { helpers, makeTestFunction } from './helpers-integration';
 
 const test = makeTestFunction({ workflowsPath: __filename });
 
@@ -103,7 +104,12 @@ export async function speculativeLocalActivity(): Promise<void> {
 }
 
 export async function speculativeCancelActivity(cancellationType: ActivityCancellationType): Promise<string> {
-  const { waitForCancel } = wf.proxyActivities<Activities>({ startToCloseTimeout: '1 minute', cancellationType });
+  const { waitForCancel } = wf.proxyActivities<Activities>({
+    startToCloseTimeout: '1 minute',
+    // Without optimistic start, the Activity learns about the cancellation from its heartbeats
+    heartbeatTimeout: '2s',
+    cancellationType,
+  });
   return await wf.speculative(async () => {
     const scope = new wf.CancellationScope();
     const promise = scope.run(() => waitForCancel());
@@ -156,13 +162,45 @@ function describeHistory(history: temporal.api.history.v1.IHistory): string[] {
   return (history.events ?? []).map(describeEvent);
 }
 
-async function assertOptimisticStartCapability(t: ExecutionContext<Context>): Promise<void> {
+function isOptimistic(described: string): boolean {
+  return described.endsWith(' optimistic');
+}
+
+async function optimisticStartSupported(t: ExecutionContext<Context>): Promise<boolean> {
   const { client } = t.context.env;
   const { namespaceInfo } = await client.workflowService.describeNamespace({ namespace: client.options.namespace });
-  t.true(
-    namespaceInfo?.capabilities?.optimisticStart,
-    `Namespace '${client.options.namespace}' must have the optimistic_start capability`
-  );
+  return namespaceInfo?.capabilities?.optimisticStart ?? false;
+}
+
+/**
+ * Assert the shape of a history, as described by {@link describeHistory}: `expectedIfSupported` with
+ * the `optimistic_start` capability (if given), and no optimistic flags without it.
+ */
+function assertHistory(
+  t: ExecutionContext<Context>,
+  history: temporal.api.history.v1.IHistory,
+  supported: boolean,
+  expectedIfSupported?: string[]
+): string[] {
+  const described = describeHistory(history);
+  if (!supported) {
+    t.false(described.some(isOptimistic), JSON.stringify(described));
+  } else if (expectedIfSupported !== undefined) {
+    t.deepEqual(described, expectedIfSupported);
+  }
+  return described;
+}
+
+async function waitForHistory(
+  handle: WorkflowHandle,
+  predicate: (described: string[]) => boolean,
+  timeoutMs = 10_000
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate(describeHistory(await handle.fetchHistory()))) {
+    if (Date.now() > deadline) throw new Error('Timed out waiting for history');
+    await setTimeoutPromise(100);
+  }
 }
 
 async function assertWorkflowTaskFailed(
@@ -194,7 +232,7 @@ async function assertWorkflowTaskFailed(
 for (const maxCachedWorkflows of [undefined, 0]) {
   const title = maxCachedWorkflows === 0 ? ' without a Workflow cache' : '';
   test(`Speculative block runs the design example and hands off a long Activity${title}`, async (t) => {
-    await assertOptimisticStartCapability(t);
+    const supported = await optimisticStartSupported(t);
     const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
 
     const tokens: Record<string, boolean> = {};
@@ -228,10 +266,10 @@ for (const maxCachedWorkflows of [undefined, 0]) {
     const handle = await startWorkflow(speculativeExample, { workflowTaskTimeout: '3s' });
     const result = await worker.runUntil(handle.result());
     t.deepEqual(result, ['act2', 'act1', 'act3']);
-    t.deepEqual(tokens, { act1: true, act2: true, act3: true });
+    t.deepEqual(tokens, { act1: supported, act2: supported, act3: supported });
 
     const history = await handle.fetchHistory();
-    t.deepEqual(describeHistory(history), [
+    assertHistory(t, history, supported, [
       'WorkflowExecutionStarted',
       'WorkflowTaskScheduled',
       'WorkflowTaskStarted',
@@ -254,34 +292,36 @@ for (const maxCachedWorkflows of [undefined, 0]) {
       'WorkflowExecutionCompleted',
     ]);
 
-    // Workflow time recorded on resolutions moves forward, and the timer took at least its duration
-    const events = history.events!;
-    const resolutionTimes = events
-      .map(
-        (e) =>
-          e.activityTaskCompletedEventAttributes?.optimisticResolution?.workflowTime ??
-          e.timerFiredEventAttributes?.optimisticResolution?.workflowTime
-      )
-      .filter((time) => time != null)
-      .map((time) => tsToMs(time));
-    t.is(resolutionTimes.length, 3);
-    t.deepEqual(
-      resolutionTimes,
-      [...resolutionTimes].sort((a, b) => a - b)
-    );
-    const timerStarted = tsToMs(events[10]!.timerStartedEventAttributes!.optimisticStart!.startTime);
-    t.true(resolutionTimes[2]! - timerStarted >= 300);
-    // The Workflow Task didn't time out: the window checkpointed before its deadline
-    const wftStarted = tsToMs(events[2]!.eventTime);
-    const wftCompleted = tsToMs(events[3]!.eventTime);
-    t.true(wftCompleted - wftStarted < 3000, `Checkpoint after ${wftCompleted - wftStarted}ms`);
+    if (supported) {
+      // Workflow time recorded on resolutions moves forward, and the timer took at least its duration
+      const events = history.events!;
+      const resolutionTimes = events
+        .map(
+          (e) =>
+            e.activityTaskCompletedEventAttributes?.optimisticResolution?.workflowTime ??
+            e.timerFiredEventAttributes?.optimisticResolution?.workflowTime
+        )
+        .filter((time) => time != null)
+        .map((time) => tsToMs(time));
+      t.is(resolutionTimes.length, 3);
+      t.deepEqual(
+        resolutionTimes,
+        [...resolutionTimes].sort((a, b) => a - b)
+      );
+      const timerStarted = tsToMs(events[10]!.timerStartedEventAttributes!.optimisticStart!.startTime);
+      t.true(resolutionTimes[2]! - timerStarted >= 300);
+      // The Workflow Task didn't time out: the window checkpointed before its deadline
+      const wftStarted = tsToMs(events[2]!.eventTime);
+      const wftCompleted = tsToMs(events[3]!.eventTime);
+      t.true(wftCompleted - wftStarted < 3000, `Checkpoint after ${wftCompleted - wftStarted}ms`);
+    }
 
     await runReplayHistory({}, history);
   });
 }
 
 test('Workflow time advances across speculative timers', async (t) => {
-  await assertOptimisticStartCapability(t);
+  const supported = await optimisticStartSupported(t);
   const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
   const worker = await createWorker();
   const handle = await startWorkflow(speculativeTimeLoop);
@@ -291,20 +331,22 @@ test('Workflow time advances across speculative timers', async (t) => {
   t.true(iterations >= 1 && iterations <= 5, `${iterations} iterations`);
 
   const history = await handle.fetchHistory();
-  const described = describeHistory(history);
-  t.is(described.filter((d) => d === 'TimerStarted optimistic').length, iterations);
-  t.is(described.filter((d) => d === 'TimerFired optimistic').length, iterations);
-  // All in a single Workflow Task
-  t.is(described.filter((d) => d === 'WorkflowTaskCompleted').length, 1);
-  // Workflow time when the loop ended is the time recorded on the last timer resolution
-  const lastFired = history.events!.findLast((e) => e.timerFiredEventAttributes)!;
-  t.is(end, tsToMs(lastFired.timerFiredEventAttributes!.optimisticResolution!.workflowTime));
+  const described = assertHistory(t, history, supported);
+  if (supported) {
+    t.is(described.filter((d) => d === 'TimerStarted optimistic').length, iterations);
+    t.is(described.filter((d) => d === 'TimerFired optimistic').length, iterations);
+    // All in a single Workflow Task
+    t.is(described.filter((d) => d === 'WorkflowTaskCompleted').length, 1);
+    // Workflow time when the loop ended is the time recorded on the last timer resolution
+    const lastFired = history.events!.findLast((e) => e.timerFiredEventAttributes)!;
+    t.is(end, tsToMs(lastFired.timerFiredEventAttributes!.optimisticResolution!.workflowTime));
+  }
 
   await runReplayHistory({}, history);
 });
 
 test('Failed speculative Activity is retried by the server', async (t) => {
-  await assertOptimisticStartCapability(t);
+  const supported = await optimisticStartSupported(t);
   const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
   const attempts: { attempt: number; optimistic: boolean }[] = [];
   const worker = await createWorker({
@@ -319,14 +361,18 @@ test('Failed speculative Activity is retried by the server', async (t) => {
   });
   const handle = await startWorkflow(speculativeFlakyActivity);
   t.is(await worker.runUntil(handle.result()), 'ok');
+  // Retries are dispatched by the server
   t.deepEqual(attempts, [
-    { attempt: 1, optimistic: true },
+    { attempt: 1, optimistic: supported },
     { attempt: 2, optimistic: false },
   ]);
 
   const history = await handle.fetchHistory();
-  const described = describeHistory(history);
-  t.true(described.includes('ActivityTaskScheduled flaky optimistic'));
+  const described = assertHistory(t, history, supported);
+  if (supported) {
+    t.true(described.includes('ActivityTaskScheduled flaky optimistic'));
+  }
+  // The failed attempt is recorded like any other, through the normal RPC
   const started = history.events!.find(
     (e) => e.activityTaskStartedEventAttributes
   )!.activityTaskStartedEventAttributes!;
@@ -338,7 +384,7 @@ test('Failed speculative Activity is retried by the server', async (t) => {
 });
 
 test('Signal received during a speculation window is delivered after the checkpoint', async (t) => {
-  await assertOptimisticStartCapability(t);
+  const supported = await optimisticStartSupported(t);
   const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
   let resolveStarted!: () => void;
   const started = new Promise<void>((resolve) => (resolveStarted = resolve));
@@ -347,7 +393,7 @@ test('Signal received during a speculation window is delivered after the checkpo
   const worker = await createWorker({
     activities: {
       async blockUntilReleased() {
-        t.true(isOptimisticToken(activity.activityInfo().taskToken));
+        t.is(isOptimisticToken(activity.activityInfo().taskToken), supported);
         resolveStarted();
         await released;
       },
@@ -357,16 +403,40 @@ test('Signal received during a speculation window is delivered after the checkpo
   const result = await worker.runUntil(async () => {
     await started;
     await handle.signal(releaseSignal);
+    if (!supported) {
+      // The signal gets its own Workflow Task while the Activity runs
+      await waitForHistory(
+        handle,
+        (described) => described.includes('WorkflowExecutionSignaled') && described.at(-1) === 'WorkflowTaskCompleted'
+      );
+    }
     release();
     return await handle.result();
   });
-  t.deepEqual(result, ['activity completed, signaled=false', 'signal']);
 
   const history = await handle.fetchHistory();
-  const described = describeHistory(history);
-  const completed = described.indexOf('ActivityTaskCompleted 5 optimistic');
-  const signaled = described.indexOf('WorkflowExecutionSignaled');
-  t.true(completed > 0 && signaled > completed, JSON.stringify(described));
+  if (supported) {
+    // The signal arrived during the window, so the workflow observed it only after the Activity
+    // result it had already seen
+    t.deepEqual(result, ['activity completed, signaled=false', 'signal']);
+    assertHistory(t, history, supported, [
+      'WorkflowExecutionStarted',
+      'WorkflowTaskScheduled',
+      'WorkflowTaskStarted',
+      'WorkflowTaskCompleted',
+      'ActivityTaskScheduled blockUntilReleased optimistic',
+      'ActivityTaskStarted 5 optimistic',
+      'ActivityTaskCompleted 5 optimistic',
+      'WorkflowExecutionSignaled',
+      'WorkflowTaskScheduled',
+      'WorkflowTaskStarted',
+      'WorkflowTaskCompleted',
+      'WorkflowExecutionCompleted',
+    ]);
+  } else {
+    t.deepEqual(result, ['signal', 'activity completed, signaled=true']);
+    assertHistory(t, history, supported);
+  }
 
   await runReplayHistory({}, history);
 });
@@ -392,16 +462,21 @@ for (const cancellationType of [
   ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
 ]) {
   test(`Speculative Activity can be cancelled (${cancellationType})`, async (t) => {
-    await assertOptimisticStartCapability(t);
+    const supported = await optimisticStartSupported(t);
     const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
     let resolveCancelled!: () => void;
     const activityCancelled = new Promise<void>((resolve) => (resolveCancelled = resolve));
     const worker = await createWorker({
       activities: {
         async waitForCancel() {
-          t.true(isOptimisticToken(activity.activityInfo().taskToken));
+          t.is(isOptimisticToken(activity.activityInfo().taskToken), supported);
+          const ctx = activity.Context.current();
           try {
-            await activity.Context.current().cancelled;
+            // Rejects once the Activity is cancelled
+            for (;;) {
+              ctx.heartbeat();
+              await ctx.sleep(100);
+            }
           } finally {
             resolveCancelled();
           }
@@ -411,81 +486,42 @@ for (const cancellationType of [
     const handle = await startWorkflow(speculativeCancelActivity, { args: [cancellationType] });
     const result = await worker.runUntil(async () => {
       const result = await handle.result();
+      // The Activity itself learns about the cancellation either way
       await activityCancelled;
       return result;
     });
     t.is(result, 'cancelled');
 
     const history = await handle.fetchHistory();
-    const described = describeHistory(history);
-    const expectedPrefix = [
-      'WorkflowExecutionStarted',
-      'WorkflowTaskScheduled',
-      'WorkflowTaskStarted',
-      'WorkflowTaskCompleted',
-      'ActivityTaskScheduled waitForCancel optimistic',
-      'TimerStarted optimistic',
-      'TimerFired optimistic',
-      'ActivityTaskCancelRequested 5',
-    ];
-    t.deepEqual(described.slice(0, expectedPrefix.length), expectedPrefix);
-    if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
-      // The workflow observed the cancellation inside the window
-      t.deepEqual(described.slice(expectedPrefix.length), [
-        'ActivityTaskStarted 5 optimistic',
-        'ActivityTaskCanceled 5 optimistic',
-        'WorkflowExecutionCompleted',
-      ]);
+    const described = assertHistory(t, history, supported);
+    if (supported) {
+      const expectedPrefix = [
+        'WorkflowExecutionStarted',
+        'WorkflowTaskScheduled',
+        'WorkflowTaskStarted',
+        'WorkflowTaskCompleted',
+        'ActivityTaskScheduled waitForCancel optimistic',
+        'TimerStarted optimistic',
+        'TimerFired optimistic',
+        'ActivityTaskCancelRequested 5',
+      ];
+      t.deepEqual(described.slice(0, expectedPrefix.length), expectedPrefix);
+      if (cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED) {
+        // The workflow observed the cancellation inside the window
+        t.deepEqual(described.slice(expectedPrefix.length), [
+          'ActivityTaskStarted 5 optimistic',
+          'ActivityTaskCanceled 5 optimistic',
+          'WorkflowExecutionCompleted',
+        ]);
+      } else {
+        // The workflow completed without waiting, so the Activity's cancellation never makes it to
+        // history
+        t.deepEqual(described.slice(expectedPrefix.length), ['WorkflowExecutionCompleted']);
+      }
     } else {
-      t.deepEqual(described.slice(expectedPrefix.length), ['WorkflowExecutionCompleted']);
+      t.true(described.includes('ActivityTaskCancelRequested 5'), JSON.stringify(described));
     }
 
     await runReplayHistory({}, history);
   });
 }
-
-test('Speculative block runs normally against a server without optimistic start', async (t) => {
-  const env = await createLocalTestEnvironment();
-  try {
-    const { namespaceInfo } = await env.client.workflowService.describeNamespace({
-      namespace: env.client.options.namespace,
-    });
-    t.falsy(namespaceInfo?.capabilities?.optimisticStart);
-
-    const { createWorker, startWorkflow, runReplayHistory } = helpers(t, env);
-    const tokens: boolean[] = [];
-    const worker = await createWorker({
-      activities: {
-        async act1() {
-          tokens.push(isOptimisticToken(activity.activityInfo().taskToken));
-          await setTimeoutPromise(100);
-          return 'act1';
-        },
-        async act2() {
-          tokens.push(isOptimisticToken(activity.activityInfo().taskToken));
-          return 'act2';
-        },
-        async act3() {
-          tokens.push(isOptimisticToken(activity.activityInfo().taskToken));
-          return 'act3';
-        },
-      },
-    });
-    const handle = await startWorkflow(speculativeExample);
-    const result = await worker.runUntil(handle.result());
-    t.deepEqual(result, ['act2', 'act1', 'act3']);
-    t.deepEqual(tokens, [false, false, false]);
-
-    const history = await handle.fetchHistory();
-    const described = describeHistory(history);
-    t.false(
-      described.some((d) => d.endsWith(' optimistic')),
-      JSON.stringify(described)
-    );
-    t.true(described.filter((d) => d === 'WorkflowTaskCompleted').length >= 4);
-
-    await runReplayHistory({}, history);
-  } finally {
-    await env.teardown();
-  }
-});
