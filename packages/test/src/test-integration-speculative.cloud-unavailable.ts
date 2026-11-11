@@ -12,7 +12,7 @@ import * as activity from '@temporalio/activity';
 import type { WorkflowHandle } from '@temporalio/client';
 import { ApplicationFailure } from '@temporalio/common';
 import { tsToMs } from '@temporalio/common/lib/time';
-import type { temporal } from '@temporalio/proto';
+import { temporal } from '@temporalio/proto';
 import * as wf from '@temporalio/workflow';
 import { ActivityCancellationType } from '@temporalio/workflow';
 import type { Context } from './helpers-integration';
@@ -27,6 +27,7 @@ interface Activities {
   flaky(): Promise<string>;
   blockUntilReleased(): Promise<void>;
   waitForCancel(): Promise<void>;
+  slowFirstAttempt(): Promise<number>;
 }
 
 const { act1, act2, act3, flaky, blockUntilReleased } = wf.proxyActivities<Activities>({
@@ -126,6 +127,77 @@ export async function speculativeCancelActivity(cancellationType: ActivityCancel
   });
 }
 
+/** Cancels an Activity and a timer together, with a single CancellationScope. */
+export async function speculativeCancelActivityAndTimer(cancellationType: ActivityCancellationType): Promise<string[]> {
+  const { waitForCancel } = wf.proxyActivities<Activities>({
+    startToCloseTimeout: '1 minute',
+    heartbeatTimeout: '2s',
+    cancellationType,
+  });
+  return await wf.speculative(async () => {
+    const scope = new wf.CancellationScope();
+    const activityDone = scope.run(() => waitForCancel());
+    const timerDone = scope.run(() => wf.sleep('1 minute'));
+    // Let the Activity start, inside the same window
+    await wf.sleep(200);
+    scope.cancel();
+    const outcomes = await Promise.allSettled([activityDone, timerDone]);
+    return outcomes.map((o) => (o.status === 'rejected' && wf.isCancellation(o.reason) ? 'cancelled' : o.status));
+  });
+}
+
+/** Schedules an Activity and cancels it in the same activation, between other speculative commands. */
+export async function speculativeScheduleAndCancel(): Promise<string[]> {
+  return await wf.speculative(async () => {
+    const first = act1();
+    const scope = new wf.CancellationScope();
+    const second = scope
+      .run(() => act2())
+      .then(
+        () => 'completed',
+        (err) => (wf.isCancellation(err) ? 'cancelled' : `failed: ${err}`)
+      );
+    scope.cancel();
+    // Lets the cancellation be issued before the next commands, without leaving the activation
+    await scope.cancelRequested.catch(() => undefined);
+    const third = act3();
+    const timer = wf.sleep(100).then(() => 'timer');
+    return await Promise.all([first, second, third, timer]);
+  });
+}
+
+/** Two timers that fire together. The first one observed cancels the other. */
+export async function speculativeTimerCancelRace(): Promise<string> {
+  return await wf.speculative(async () => {
+    const scopes = [new wf.CancellationScope(), new wf.CancellationScope()];
+    const timers = scopes.map((scope, i) => scope.run(() => wf.sleep(300)).then(() => i));
+    const winner = await Promise.race(timers);
+    scopes[1 - winner]!.cancel();
+    await Promise.allSettled(timers);
+    return `timer${winner + 1}`;
+  });
+}
+
+/** Completes while a speculative Activity is still running. */
+export async function speculativeCompleteWithActivityRunning(): Promise<string> {
+  const { waitForCancel } = wf.proxyActivities<Activities>({ startToCloseTimeout: '1 minute', heartbeatTimeout: '2s' });
+  return await wf.speculative(async () => {
+    // Never awaited, so it's still running when the workflow completes
+    void waitForCancel();
+    await wf.sleep(200);
+    return 'done';
+  });
+}
+
+/** Runs an Activity whose first attempt is still running at the window's deadline, then times out. */
+export async function speculativeTimeoutAfterHandoff(): Promise<number> {
+  const { slowFirstAttempt } = wf.proxyActivities<Activities>({
+    startToCloseTimeout: '3s',
+    retry: { initialInterval: '100ms', maximumAttempts: 2 },
+  });
+  return await wf.speculative(() => slowFirstAttempt());
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Helpers
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -189,6 +261,25 @@ function assertHistory(
     t.deepEqual(described, expectedIfSupported);
   }
   return described;
+}
+
+/**
+ * An Activity implementation that heartbeats until it's cancelled, then calls `onCancelled` with the
+ * error it got.
+ */
+function heartbeatUntilCancelled(onCancelled: (err: unknown) => void): () => Promise<void> {
+  return async () => {
+    const ctx = activity.Context.current();
+    try {
+      for (;;) {
+        ctx.heartbeat();
+        await ctx.sleep(100);
+      }
+    } catch (err) {
+      onCancelled(err);
+      throw err;
+    }
+  };
 }
 
 async function waitForHistory(
@@ -525,3 +616,236 @@ for (const cancellationType of [
     await runReplayHistory({}, history);
   });
 }
+
+for (const cancellationType of [
+  ActivityCancellationType.TRY_CANCEL,
+  ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+]) {
+  test(`CancellationScope cancels a speculative Activity and timer together (${cancellationType})`, async (t) => {
+    const supported = await optimisticStartSupported(t);
+    const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
+    let resolveCancelled!: (err: unknown) => void;
+    const activityCancelled = new Promise<unknown>((resolve) => (resolveCancelled = resolve));
+    const worker = await createWorker({
+      activities: { waitForCancel: heartbeatUntilCancelled(resolveCancelled) },
+    });
+    const handle = await startWorkflow(speculativeCancelActivityAndTimer, { args: [cancellationType] });
+    const result = await worker.runUntil(async () => {
+      const result = await handle.result();
+      t.true((await activityCancelled) instanceof activity.CancelledFailure);
+      return result;
+    });
+    t.deepEqual(result, ['cancelled', 'cancelled']);
+
+    const history = await handle.fetchHistory();
+    const described = assertHistory(t, history, supported, [
+      'WorkflowExecutionStarted',
+      'WorkflowTaskScheduled',
+      'WorkflowTaskStarted',
+      'WorkflowTaskCompleted',
+      'ActivityTaskScheduled waitForCancel optimistic',
+      'TimerStarted optimistic',
+      'TimerStarted optimistic',
+      'TimerFired optimistic',
+      'ActivityTaskCancelRequested 5',
+      'TimerCanceled',
+      ...(cancellationType === ActivityCancellationType.WAIT_CANCELLATION_COMPLETED
+        ? ['ActivityTaskStarted 5 optimistic', 'ActivityTaskCanceled 5 optimistic']
+        : []),
+      'WorkflowExecutionCompleted',
+    ]);
+    t.true(described.includes('ActivityTaskCancelRequested 5'), JSON.stringify(described));
+    t.true(described.includes('TimerCanceled'), JSON.stringify(described));
+
+    await runReplayHistory({}, history);
+  });
+}
+
+test('Speculative Activity scheduled and cancelled in the same activation is dropped', async (t) => {
+  const supported = await optimisticStartSupported(t);
+  const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
+  const started: string[] = [];
+  const worker = await createWorker({
+    activities: {
+      async act1() {
+        started.push('act1');
+        return 'act1';
+      },
+      async act2() {
+        started.push('act2');
+        return 'act2';
+      },
+      async act3() {
+        started.push('act3');
+        return 'act3';
+      },
+    },
+  });
+  const handle = await startWorkflow(speculativeScheduleAndCancel);
+  t.deepEqual(await worker.runUntil(handle.result()), ['act1', 'cancelled', 'act3', 'timer']);
+  // The cancelled Activity never reaches the server or the Activity worker
+  t.deepEqual(started.sort(), ['act1', 'act3']);
+
+  const history = await handle.fetchHistory();
+  const described = assertHistory(t, history, supported);
+  t.false(
+    described.some((d) => d.includes('act2')),
+    JSON.stringify(described)
+  );
+  if (supported) {
+    // The commands around the dropped one are recorded with the event IDs Core predicted
+    t.deepEqual(described.slice(0, 7), [
+      'WorkflowExecutionStarted',
+      'WorkflowTaskScheduled',
+      'WorkflowTaskStarted',
+      'WorkflowTaskCompleted',
+      'ActivityTaskScheduled act1 optimistic',
+      'ActivityTaskScheduled act3 optimistic',
+      'TimerStarted optimistic',
+    ]);
+    // Resolutions are recorded in the order the workflow observed them, which may vary
+    t.deepEqual(described.slice(7, -1).sort(), [
+      'ActivityTaskCompleted 5 optimistic',
+      'ActivityTaskCompleted 6 optimistic',
+      'ActivityTaskStarted 5 optimistic',
+      'ActivityTaskStarted 6 optimistic',
+      'TimerFired optimistic',
+    ]);
+    t.is(described.at(-1), 'WorkflowExecutionCompleted');
+  }
+
+  await runReplayHistory({}, history);
+});
+
+test('Cancelling a speculative timer that already fired locally never records its firing', async (t) => {
+  const supported = await optimisticStartSupported(t);
+  const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
+  const worker = await createWorker();
+  const handle = await startWorkflow(speculativeTimerCancelRace);
+  const winner = await worker.runUntil(handle.result());
+  t.true(winner === 'timer1' || winner === 'timer2', winner);
+
+  const history = await handle.fetchHistory();
+  assertHistory(t, history, supported, [
+    'WorkflowExecutionStarted',
+    'WorkflowTaskScheduled',
+    'WorkflowTaskStarted',
+    'WorkflowTaskCompleted',
+    'TimerStarted optimistic',
+    'TimerStarted optimistic',
+    'TimerFired optimistic',
+    'TimerCanceled',
+    'WorkflowExecutionCompleted',
+  ]);
+  if (supported) {
+    const [fired, cancelled] = winner === 'timer1' ? ['1', '2'] : ['2', '1'];
+    t.is(history.events!.find((e) => e.timerFiredEventAttributes)!.timerFiredEventAttributes!.timerId, fired);
+    t.is(history.events!.find((e) => e.timerCanceledEventAttributes)!.timerCanceledEventAttributes!.timerId, cancelled);
+  }
+
+  await runReplayHistory({}, history);
+});
+
+test('Workflow completing while a speculative Activity runs cancels the Activity', async (t) => {
+  const supported = await optimisticStartSupported(t);
+  const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
+  let resolveCancelled!: (err: unknown) => void;
+  const activityCancelled = new Promise<unknown>((resolve) => (resolveCancelled = resolve));
+  const tokens: boolean[] = [];
+  const cancel = heartbeatUntilCancelled(resolveCancelled);
+  const worker = await createWorker({
+    activities: {
+      async waitForCancel() {
+        tokens.push(isOptimisticToken(activity.activityInfo().taskToken));
+        await cancel();
+      },
+    },
+  });
+  const handle = await startWorkflow(speculativeCompleteWithActivityRunning);
+  const result = await worker.runUntil(async () => {
+    const result = await handle.result();
+    t.true((await activityCancelled) instanceof activity.CancelledFailure);
+    return result;
+  });
+  t.is(result, 'done');
+  t.deepEqual(tokens, [supported]);
+
+  const history = await handle.fetchHistory();
+  assertHistory(t, history, supported, [
+    'WorkflowExecutionStarted',
+    'WorkflowTaskScheduled',
+    'WorkflowTaskStarted',
+    'WorkflowTaskCompleted',
+    'ActivityTaskScheduled waitForCancel optimistic',
+    'TimerStarted optimistic',
+    'TimerFired optimistic',
+    'WorkflowExecutionCompleted',
+  ]);
+
+  await runReplayHistory({}, history);
+});
+
+test('Handed-off speculative Activity times out on the server and is retried', async (t) => {
+  const supported = await optimisticStartSupported(t);
+  const { createWorker, startWorkflow, runReplayHistory } = helpers(t);
+  const attempts: { attempt: number; optimistic: boolean }[] = [];
+  let resolveCancelled!: (err: unknown) => void;
+  const firstAttemptCancelled = new Promise<unknown>((resolve) => (resolveCancelled = resolve));
+  const worker = await createWorker({
+    activities: {
+      async slowFirstAttempt() {
+        const info = activity.activityInfo();
+        attempts.push({ attempt: info.attempt, optimistic: isOptimisticToken(info.taskToken) });
+        if (info.attempt === 1) {
+          // Still running at 80% of the Workflow Task timeout, so it's handed off, and then runs
+          // past its start-to-close timeout
+          try {
+            await activity.Context.current().cancelled;
+          } catch (err) {
+            resolveCancelled(err);
+            throw err;
+          }
+        }
+        return info.attempt;
+      },
+    },
+  });
+  const handle = await startWorkflow(speculativeTimeoutAfterHandoff, { workflowTaskTimeout: '2s' });
+  const result = await worker.runUntil(async () => {
+    const result = await handle.result();
+    // The worker's local timeout cancels the first attempt's execution
+    t.true((await firstAttemptCancelled) instanceof activity.CancelledFailure);
+    return result;
+  });
+  t.is(result, 2);
+  t.deepEqual(attempts, [
+    { attempt: 1, optimistic: supported },
+    { attempt: 2, optimistic: false },
+  ]);
+
+  const history = await handle.fetchHistory();
+  assertHistory(t, history, supported, [
+    'WorkflowExecutionStarted',
+    'WorkflowTaskScheduled',
+    'WorkflowTaskStarted',
+    'WorkflowTaskCompleted',
+    'ActivityTaskScheduled slowFirstAttempt optimistic',
+    'ActivityTaskStarted 5',
+    'ActivityTaskCompleted 5',
+    'WorkflowTaskScheduled',
+    'WorkflowTaskStarted',
+    'WorkflowTaskCompleted',
+    'WorkflowExecutionCompleted',
+  ]);
+  // The server timed out the first attempt and retried it, as for any Activity
+  const started = history.events!.find(
+    (e) => e.activityTaskStartedEventAttributes
+  )!.activityTaskStartedEventAttributes!;
+  t.is(started.attempt, 2);
+  t.is(
+    started.lastFailure?.timeoutFailureInfo?.timeoutType,
+    temporal.api.enums.v1.TimeoutType.TIMEOUT_TYPE_START_TO_CLOSE
+  );
+
+  await runReplayHistory({}, history);
+});
